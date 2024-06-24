@@ -1,87 +1,117 @@
-from flask import Flask, render_template_string, request, redirect, url_for
-from flask_sqlalchemy import SQLAlchemy
-from validators import url as validate_url
-import random
+from flask import Flask, request, redirect, flash
 import string
+import random
+import sqlite3
+import os
+from urllib.parse import urlparse
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///url_shortener.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = 'your_secret_key_here'
-db = SQLAlchemy(app)
+app.secret_key = os.urandom(24)  # Secret key for session
+
+# SQLite database initialization
+conn = sqlite3.connect('url_shortener.db', check_same_thread=False)
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS urls
+             (id INTEGER PRIMARY KEY AUTOINCREMENT,
+              original_url TEXT NOT NULL,
+              short_code TEXT UNIQUE NOT NULL)''')
+conn.commit()
 
 
-# Database model for URL storage
-class URL(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    original_url = db.Column(db.String(2048), nullable=False)
-    short_code = db.Column(db.String(20), unique=True, nullable=False)
-    click_count = db.Column(db.Integer, default=0)
-
-    def __repr__(self):
-        return f"URL('{self.original_url}', '{self.short_code}')"
-
-
-def generate_random_code():
-    """Generate a random alphanumeric code."""
+def generate_short_code():
     characters = string.ascii_letters + string.digits
-    code_length = 6  # Adjust the length of the generated code as needed
-    return ''.join(random.choice(characters) for _ in range(code_length))
+    while True:
+        short_code = ''.join(random.choices(characters, k=6))  # Generate a 6-character code
+        c.execute("SELECT id FROM urls WHERE short_code = ?", (short_code,))
+        if c.fetchone() is None:
+            return short_code
+
+
+def insert_url(original_url, short_code):
+    try:
+        c.execute("INSERT INTO urls (original_url, short_code) VALUES (?, ?)", (original_url, short_code))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        return False
+    return True
 
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
-        original_url = request.form['url']
-        custom_short_code = request.form.get('custom_short_code', None)
+        original_url = request.form['url'].strip()  # Remove leading/trailing spaces
+        custom_short_code = request.form['custom_code'].strip()  # Custom short code
 
+        # If the URL does not start with 'http://' or 'https://', prepend 'http://'
+        if not urlparse(original_url).scheme:
+            original_url = 'http://' + original_url
+
+        # Validate URL
         if not validate_url(original_url):
-            return "Invalid URL", 400
+            flash('Invalid URL. Please enter a valid URL.', 'error')
+            return redirect('/')
 
+        # If custom short code is provided, use it; otherwise generate a new one
         if custom_short_code:
-            if URL.query.filter_by(short_code=custom_short_code).first():
-                return "Custom short code already exists. Please choose another one.", 400
+            if not is_valid_custom_code(custom_short_code):
+                flash('Invalid custom code. Use only letters and digits.', 'error')
+                return redirect('/')
             short_code = custom_short_code
         else:
-            short_code = generate_random_code()
-            while URL.query.filter_by(short_code=short_code).first():
-                short_code = generate_random_code()
+            short_code = generate_short_code()
 
-        # Save to database
-        url_entry = URL(original_url=original_url, short_code=short_code)
-        db.session.add(url_entry)
-        db.session.commit()
+        # Try to insert URL into the database with the chosen short code
+        if not insert_url(original_url, short_code):
+            flash(f'Custom code "{short_code}" already exists. Please choose another.', 'error')
+            return redirect('/')
 
-        return f"Shortened URL: <a href='{request.host_url}{short_code}'>{request.host_url}{short_code}</a>"
+        short_url = request.host_url + short_code
+        return '''
+        <h2>URL Shortener</h2>
+        <p>Shortened URL: <a href="{0}">{0}</a></p>
+        '''.format(short_url)
 
-    # Render the form directly in the script
-    form_html = '''
-    <html>
-    <head><title>URL Shortener</title></head>
-    <body>
-        <h1>URL Shortener</h1>
-        <form method="POST" action="/">
-            <label for="url">Enter your URL:</label><br>
-            <input type="text" id="url" name="url" required><br><br>
-            <label for="custom_short_code">Custom Short Code (optional):</label><br>
-            <input type="text" id="custom_short_code" name="custom_short_code"><br><br>
-            <input type="submit" value="Shorten URL">
-        </form>
-    </body>
-    </html>
+    return '''
+    <h2>URL Shortener</h2>
+    <form method="post" action="/">
+        <label for="url">Enter your URL:</label><br>
+        <input type="text" id="url" name="url" required><br><br>
+        <label for="custom_code">Custom Short Code (optional):</label><br>
+        <input type="text" id="custom_code" name="custom_code"><br><br>
+        <input type="submit" value="Shorten URL">
+    </form>
     '''
-
-    return render_template_string(form_html)
 
 
 @app.route('/<short_code>')
 def redirect_to_url(short_code):
-    url_entry = URL.query.filter_by(short_code=short_code).first_or_404()
-    url_entry.click_count += 1
-    db.session.commit()
-    return redirect(url_entry.original_url)
+    original_url = get_original_url(short_code)
+    if original_url:
+        return redirect(original_url)
+    else:
+        flash('URL not found!', 'error')
+        return redirect('/')
+
+
+def validate_url(url):
+    # Basic URL validation using urlparse from urllib.parse
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except ValueError:
+        return False
+
+
+def is_valid_custom_code(custom_code):
+    # Check if the custom code only contains letters and digits
+    return custom_code.isalnum()
+
+
+def get_original_url(short_code):
+    c.execute("SELECT original_url FROM urls WHERE short_code = ?", (short_code,))
+    result = c.fetchone()
+    return result[0] if result else None
 
 
 if __name__ == '__main__':
-    db.create_all()
     app.run(debug=True)
